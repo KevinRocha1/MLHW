@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Product Performance Analysis — Fixed</title>
+
+  <!-- Chart.js (UMD) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+  <style>
+    :root {
+      --bg: #f6f8fa;
+      --card: #ffffff;
+      --muted: #6b7280;
+      --accent: #2563eb;
+    }
+    * { box-sizing: border-box; }
+    body { font-family: Inter, "Segoe UI", Roboto, Arial, sans-serif; margin:0; background:var(--bg); color:#111; }
+    .container { max-width:1100px; margin:28px auto; padding:16px; }
+    header { background: #fff; padding:18px 20px; border-radius:10px; box-shadow:0 6px 18px rgba(15,23,42,0.04); }
+    h1 { margin:0; font-size:20px; }
+    p.lead { margin:6px 0 0; color:var(--muted); font-size:13px; }
+
+    .tabs { display:flex; gap:8px; margin-top:14px; }
+    .tab { padding:8px 12px; background:transparent; border-radius:8px; border:1px solid transparent; cursor:pointer; color:var(--muted); }
+    .tab.active { background:#fff; border-color:#e6eef9; color:#111; box-shadow:0 4px 12px rgba(10,15,30,0.03); }
+
+    .card { background:var(--card); padding:16px; border-radius:10px; margin-top:14px; box-shadow:0 6px 18px rgba(15,23,42,0.03); }
+    .upload-section { text-align:center; padding:36px 12px; }
+    .upload-btn { padding:10px 16px; border-radius:8px; border:1px solid #dbeafe; background:linear-gradient(180deg,#e6f0ff,#dbeafe); color:var(--accent); cursor:pointer; }
+    .small { font-size:13px; color:var(--muted); }
+
+    .grid-3 { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
+    .stat-card { padding:14px; border-radius:8px; background:#fbfdff; border:1px solid #eef2ff; }
+    .stat-value { font-size:1.4em; font-weight:700; color:#0f172a; }
+    .stat-label { font-size:12px; color:var(--muted); margin-top:6px; }
+
+    .chart-container { margin-top:14px; padding:12px; border-radius:8px; background:#fff; border:1px solid #f1f5f9; }
+    .chart-title { font-weight:700; color:#0f172a; margin-bottom:8px; }
+    canvas { width:100% !important; height:320px !important; }
+
+    table { width:100%; border-collapse:collapse; margin-top:12px; }
+    th,td { padding:8px 10px; border-bottom:1px solid #f1f5f9; text-align:left; }
+    th { background:#fafafa; font-weight:700; color:#0f172a; }
+
+    .cluster-card { border-left:4px solid #dbeafe; padding:12px; margin-top:10px; border-radius:6px; background:#fff; }
+    .badge { display:inline-block; padding:4px 8px; border-radius:999px; background:#eef2ff; color:var(--accent); font-weight:600; font-size:12px; }
+
+    .footer { text-align:center; margin-top:18px; color:var(--muted); font-size:13px; }
+    @media (max-width:720px) { canvas { height:300px !important; } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Product Performance Analysis</h1>
+      <p class="lead">K-means clustering (custom) • Linear & Polynomial regression • Interactive visual summaries</p>
+      <div class="tabs" style="margin-top:12px;">
+        <button class="tab active" onclick="showTab(event, 'tab-upload')">Upload</button>
+        <button class="tab" onclick="showTab(event, 'tab-overview')">Overview</button>
+        <button class="tab" onclick="showTab(event, 'tab-clustering')">Clustering</button>
+        <button class="tab" onclick="showTab(event, 'tab-regression')">Regression</button>
+      </div>
+    </header>
+
+    <div id="tab-upload" class="card" style="display:block; margin-bottom:16px;">
+      <div class="upload-section">
+        <h2>Upload product_sales.csv</h2>
+        <p class="small">Choose the CSV exported for this assignment. The page will parse, preprocess, cluster and run regression in-browser.</p>
+        <input type="file" id="fileInput" accept=".csv" style="display:none" onchange="handleFileUpload(event)">
+        <button class="upload-btn" onclick="document.getElementById('fileInput').click()">Choose CSV</button>
+        <div id="uploadStatus" style="margin-top:12px;"></div>
+      </div>
+    </div>
+
+    <div id="tab-overview" class="card" style="display:none;">
+      <div id="overviewContent" class="small">No data loaded yet. Use the Upload tab.</div>
+    </div>
+
+    <div id="tab-clustering" class="card" style="display:none;">
+      <div id="clusteringContent" class="small">No clustering results yet.</div>
+    </div>
+
+    <div id="tab-regression" class="card" style="display:none;">
+      <div id="regressionContent" class="small">No regression results yet.</div>
+    </div>
+
+    <div class="footer small">This UI runs entirely in your browser — no data leaves your machine.</div>
+  </div>
+
+  <script>
+  // -------------------------
+  // Helper & state variables
+  // -------------------------
+  let rawData = null;
+  let processedData = null; // { cleaned, normalized, stats, normalizationParams, rawBeforeCapping }
+  let clusters = null;      // { elbowData, labels, centroids, k, clusterStats }
+  let regression = null;    // { models: {linear, poly}, bestModel, predictions, y_test }
+
+  // -------------------------
+  // Tab navigation (fixed)
+  // -------------------------
+  function showTab(evt, tabId) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    evt.currentTarget.classList.add('active');
+    ['tab-upload','tab-overview','tab-clustering','tab-regression'].forEach(id => {
+      document.getElementById(id).style.display = (id === tabId) ? 'block' : 'none';
+    });
+  }
+
+  // -------------------------
+  // CSV parsing (BOM-safe + quoted fields)
+  // -------------------------
+  function parseCSV(text) {
+    // remove BOM if present
+    text = text.replace(/^\uFEFF/, '');
+
+    const lines = text.split(/\r?\n/).filter(l => l.trim() !== '');
+    if (lines.length === 0) return [];
+
+    const headers = parseCSVLine(lines[0]).map(h => h.trim());
+    const data = [];
+
+    for (let i = 1; i < lines.length; i++) {
+      const vals = parseCSVLine(lines[i]);
+      const obj = {};
+      for (let j = 0; j < headers.length; j++) {
+        const raw = vals[j] !== undefined ? vals[j].trim() : '';
+        // treat empty or NA as null
+        if (raw === '' || raw.toUpperCase() === 'NA') {
+          obj[headers[j]] = null;
+        } else if (!isNaN(raw) && raw !== '') {
+          // numeric
+          obj[headers[j]] = parseFloat(raw);
+        } else {
+          obj[headers[j]] = raw;
+        }
+      }
+      data.push(obj);
+    }
+    return data;
+  }
+
+  function parseCSVLine(line) {
+    const res = [];
+    let cur = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      const next = line[i+1];
+      if (ch === '"' ) {
+        if (inQuotes && next === '"') {
+          cur += '"'; i++; // escaped quote
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === ',' && !inQuotes) {
+        res.push(cur);
+        cur = '';
+      } else {
+        cur += ch;
+      }
+    }
+    res.push(cur);
+    return res;
+  }
+
+  // -------------------------
+  // File upload handler
+  // -------------------------
+  async function handleFileUpload(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    document.getElementById('uploadStatus').innerHTML = '<div class="small">Loading and parsing CSV...</div>';
+    try {
+      const text = await file.text();
+      rawData = parseCSV(text);
+      if (!rawData || rawData.length === 0) throw new Error('CSV parsing resulted in no rows.');
+      document.getElementById('uploadStatus').innerHTML = `<div class="small">Loaded ${rawData.length} rows. Preprocessing...</div>`;
+      preprocessData();
+      // clustering: auto-select k via elbow
+      performClustering(); // auto-select k
+      // regression
+      performRegression();
+      // switch to overview
+      document.querySelectorAll('.tab')[1].classList.add('active');
+      showTab({currentTarget: document.querySelectorAll('.tab')[1]}, 'tab-overview');
+    } catch (err) {
+      console.error(err);
+      document.getElementById('uploadStatus').innerHTML = `<div style="color:red;">Error: ${err.message}</div>`;
+    }
+  }
+
+  // -------------------------
+  // Preprocessing (median impute, IQR cap, min-max normalize)
+  // -------------------------
+  function preprocessData() {
+    const numericFields = ['price','cost','units_sold','promotion_frequency','shelf_level','profit'];
+    // deep copy
+    const cleaned = rawData.map(r => ({ ...r }));
+
+    const stats = { originalCount: cleaned.length, missing: {}, imputations: {}, outliers: {} };
+
+    // identify missing counts
+    numericFields.forEach(f => {
+      const missing = cleaned.filter(r => r[f] === null || r[f] === undefined || Number.isNaN(r[f])).length;
+      if (missing > 0) stats.missing[f] = missing;
+    });
+
+    // median imputation
+    numericFields.forEach(f => {
+      const vals = cleaned.filter(r => r[f] !== null && r[f] !== undefined && !Number.isNaN(r[f])).map(r => r[f]).sort((a,b)=>a-b);
+      if (vals.length === 0) return;
+      const mid = Math.floor(vals.length/2);
+      const median = vals.length % 2 === 1 ? vals[mid] : (vals[mid-1]+vals[mid]) / 2;
+      let imputed = 0;
+      cleaned.forEach(row => {
+        if (row[f] === null || row[f] === undefined || Number.isNaN(row[f])) { row[f] = median; imputed++; }
+      });
+      if (imputed > 0) stats.imputations[f] = { count: imputed, value: median };
+    });
+
+    // store snapshot before capping (for display)
+    const beforeCapping = cleaned.map(r => ({ ...r }));
+
+    // outlier detection & cap (IQR)
+    numericFields.forEach(f => {
+      const vals = cleaned.map(r => r[f]).sort((a,b) => a-b);
+      const q1 = vals[Math.floor((vals.length - 1) * 0.25)];
+      const q3 = vals[Math.floor((vals.length - 1) * 0.75)];
+      const iqr = q3 - q1;
+      const lower = q1 - 1.5 * iqr;
+      const upper = q3 + 1.5 * iqr;
+      let outCount = 0;
+      cleaned.forEach(row => {
+        if (row[f] < lower) { row[f] = lower; outCount++; }
+        else if (row[f] > upper) { row[f] = upper; outCount++; }
+      });
+      if (outCount > 0) stats.outliers[f] = { count: outCount, lower, upper };
+    });
+
+    // min-max normalization (create separate fields)
+    const normalizationParams = {};
+    const normalized = cleaned.map(r => ({ ...r }));
+    numericFields.forEach(f => {
+      const vals = normalized.map(r => r[f]);
+      const min = Math.min(...vals);
+      const max = Math.max(...vals);
+      normalizationParams[f] = { min, max };
+      normalized.forEach(row => {
+        row[`${f}_normalized`] = (max > min) ? (row[f] - min) / (max - min) : 0;
+      });
+    });
+
+    processedData = { cleaned, normalized, stats, normalizationParams, rawBeforeCapping: beforeCapping };
+    renderOverview();
+  }
+
+  // -------------------------
+  // Overview rendering
+  // -------------------------
+  function renderOverview() {
+    const { cleaned, stats } = processedData;
+    const totalProfit = cleaned.reduce((s,r) => s + (r.profit || 0), 0);
+    const totalProducts = stats.originalCount;
+
+    // simple stats cards
+    let html = `
+      <div class="grid-3">
+        <div class="stat-card">
+          <div class="stat-label">Total products</div>
+          <div class="stat-value">${totalProducts}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Total monthly profit</div>
+          <div class="stat-value">${(totalProfit).toFixed(2)}</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Fields with missing values</div>
+          <div class="stat-value">${Object.keys(stats.missing).length}</div>
+        </div>
+      </div>
+      <div style="margin-top:12px;">
+        <div class="chart-container">
+          <div class="chart-title">Data Preprocessing Summary</div>
+          <div class="small" style="margin-top:8px;">
+            <strong>Missing value imputation:</strong> median for numeric fields.<br/>
+            <strong>Outliers:</strong> capped by IQR (1.5×IQR).<br/>
+            <strong>Normalization:</strong> Min–Max per-field produced *_normalized fields for clustering.
+          </div>
+        </div>
+      </div>
+    `;
+
+    // show per-field summary
+    const fieldsToShow = ['price','cost','units_sold','profit'];
+    html += `<div class="chart-container"><div class="chart-title">Field summary</div><div class="grid-3">`;
+    fieldsToShow.forEach(f => {
+      const vals = processedData.cleaned.map(r => r[f]);
+      const avg = (vals.reduce((a,b)=>a+b,0)/vals.length) || 0;
+      const min = Math.min(...vals);
+      const max = Math.max(...vals);
+      html += `<div style="padding:12px; background:#fff; border-radius:8px; border:1px solid #f1f5f9;">
+                <div class="small">${f}</div>
+                <div style="font-weight:700; font-size:1.1em; margin-top:6px;">Avg ${avg.toFixed(2)}</div>
+                <div class="small" style="margin-top:6px;">Range ${min.toFixed(2)} — ${max.toFixed(2)}</div>
+               </div>`;
+    });
+    html += `</div></div>`;
+
+    document.getElementById('overviewContent').innerHTML = html;
+  }
+
+  // -------------------------
+  // Utility: Euclidean dist & shuffle
+  // -------------------------
+  function euclideanDistanceSquared(a,b) {
+    let s = 0;
+    for (let i = 0; i < a.length; i++) s += Math.pow(a[i] - b[i], 2);
+    return s;
+  }
+  function euclideanDistance(a,b) {
+    return Math.sqrt(euclideanDistanceSquared(a,b));
+  }
+  function shuffleArray(a, seed=null) {
+    // Fisher–Yates (non-deterministic). If you need reproducibility, add seeded RNG.
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  }
+
+  // -------------------------
+  // K-means++ and clustering (fixed WCSS calc)
+  // -------------------------
+  function kMeansClustering(data, k, maxIterations=200) {
+    // features to use for clustering: use normalized fields so scale is equal
+    const features = ['price_normalized','units_sold_normalized','profit_normalized'];
+    const points = data.map(r => features.map(f => r[f]));
+
+    // initialize centroids with KMeans++
+    const n = points.length;
+    const centroids = [];
+    const firstIdx = Math.floor(Math.random() * n);
+    centroids.push([...points[firstIdx]]);
+    for (let c = 1; c < k; c++) {
+      const distances = points.map(p => Math.min(...centroids.map(cen => euclideanDistanceSquared(p, cen))));
+      const total = distances.reduce((a,b)=>a+b,0);
+      const probs = distances.map(d => d / total);
+      const r = Math.random();
+      let cum = 0;
+      let chosen = 0;
+      for (let i = 0; i < probs.length; i++) { cum += probs[i]; if (r <= cum) { chosen = i; break; } }
+      centroids.push([...points[chosen]]);
+    }
+
+    let labels = new Array(n).fill(0);
+    let it = 0;
+    while (it < maxIterations) {
+      // assign
+      for (let i = 0; i < n; i++) {
+        const dists = centroids.map(c => euclideanDistanceSquared(points[i], c));
+        labels[i] = dists.indexOf(Math.min(...dists));
+      }
+      // update
+      const newCentroids = centroids.map((c, idx) => {
+        const clusterPoints = points.filter((p, pi) => labels[pi] === idx);
+        if (clusterPoints.length === 0) return c;
+        const dims = c.length;
+        const mean = new Array(dims).fill(0);
+        clusterPoints.forEach(p => { for (let d=0; d<dims; d++) mean[d] += p[d]; });
+        for (let d=0; d<dims; d++) mean[d] /= clusterPoints.length;
+        return mean;
+      });
+      // check convergence
+      let shift = 0;
+      for (let i=0;i<centroids.length;i++) shift += euclideanDistanceSquared(centroids[i], newCentroids[i]);
+      centroids.forEach((v,i) => centroids[i] = newCentroids[i]);
+      if (shift < 1e-6) break;
+      it++;
+    }
+
+    const wcss = points.reduce((sum, p, idx) => sum + euclideanDistanceSquared(p, centroids[labels[idx]]), 0);
+
+    return { labels, centroids, wcss, iterations: it };
+  }
+
+  // auto-select K from elbow (simple knee detection)
+  function selectKFromElbow(elbowData) {
+    // elbowData: [{k, wcss}, ...] for k ascending
+    // approach: find index of max second-difference normalized
+    const w = elbowData.map(d => d.wcss);
+    // compute discrete second differences
+    const diffs = [];
+    for (let i = 1; i < w.length; i++) diffs.push(w[i-1] - w[i]); // first differences
+    const second = [];
+    for (let i = 1; i < diffs.length; i++) second.push(diffs[i-1] - diffs[i]); // second diffs
+    if (second.length === 0) return elbowData[0].k;
+    // choose k corresponding to max second diff (largest curvature)
+    const idx = second.indexOf(Math.max(...second));
+    return elbowData[idx+1].k; // +1 shifts from second array to k index
+  }
+
+  // -------------------------
+  // performClustering (auto K or manual)
+  // -------------------------
+  function performClustering(manualK = null) {
+    const data = processedData.normalized;
+    const elbowData = [];
+    for (let k = 2; k <= 8; k++) {
+      const res = kMeansClustering(data, k, 150);
+      elbowData.push({ k, wcss: res.wcss });
+    }
+    const chosenK = manualK || selectKFromElbow(elbowData);
+    const finalRes = kMeansClustering(data, chosenK, 300);
+
+    // compute cluster stats on original (cleaned) values
+    const clusterStats = [];
+    for (let i = 0; i < chosenK; i++) {
+      const members = processedData.cleaned.filter((_, idx) => finalRes.labels[idx] === i);
+      const count = members.length;
+      const avgPrice = count ? members.reduce((s,r) => s + r.price, 0) / count : 0;
+      const avgUnits = count ? members.reduce((s,r) => s + r.units_sold, 0) / count : 0;
+      const avgProfit = count ? members.reduce((s,r) => s + r.profit, 0) / count : 0;
+      const avgPromo = count ? members.reduce((s,r) => s + r.promotion_frequency, 0) / count : 0;
+
+      // heuristic naming (non-prescriptive)
+      let name = 'Mid-Range Steady';
+      let insight = 'Stable performers.';
+      if (avgPrice <=  (processedData.cleaned.reduce((a,b)=>a+b.price,0)/processedData.cleaned.length) * 0.6 && avgUnits >= (processedData.cleaned.reduce((a,b)=>a+b.units_sold,0)/processedData.cleaned.length) * 1.1) {
+        name = 'Budget Best-Sellers'; insight = 'Low price, high volume. Ensure stock.';
+      } else if (avgPrice >= (processedData.cleaned.reduce((a,b)=>a+b.price,0)/processedData.cleaned.length) * 1.4 && avgUnits <= (processedData.cleaned.reduce((a,b)=>a+b.units_sold,0)/processedData.cleaned.length) * 0.6) {
+        name = 'Premium Low-Volume'; insight = 'High-margin niche items — marketing opportunity.';
+      } else if (avgProfit > (processedData.cleaned.reduce((a,b)=>a+b.profit,0)/processedData.cleaned.length) * 1.2) {
+        name = 'High Performers'; insight = 'Prioritize availability and placement.';
+      }
+
+      clusterStats.push({ id: i, count, avgPrice, avgUnits, avgProfit, avgPromo, name, insight });
+    }
+
+    clusters = { elbowData, labels: finalRes.labels, centroids: finalRes.centroids, k: chosenK, clusterStats };
+    renderClustering();
+  }
+
+  // -------------------------
+  // renderClustering (charts + stats)
+  // -------------------------
+  function renderClustering() {
+    const container = document.getElementById('clusteringContent');
+    if (!clusters) { container.innerHTML = '<div class="small">No clustering results.</div>'; return; }
+
+    let html = `<div class="chart-container"><div class="chart-title">Elbow Method (WCSS vs k)</div>
+                <canvas id="elbowChart"></canvas><div style="margin-top:10px;" class="small">Auto-selected k = <strong>${clusters.k}</strong>. You can re-run clustering with a different k by calling performClustering(k) in console.</div></div>`;
+
+    html += `<div class="chart-container"><div class="chart-title">Clusters — Price vs Units Sold</div><canvas id="scatterChart"></canvas></div>`;
+
+    // cluster cards
+    clusters.clusterStats.forEach(cs => {
+      html += `<div class="cluster-card" style="border-color:#dbeafe;">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                  <div><strong>Cluster ${cs.id}: ${cs.name}</strong></div>
+                  <div class="badge">${cs.count} products</div>
+                </div>
+                <div style="margin-top:8px; display:grid; grid-template-columns:repeat(3,1fr); gap:8px;">
+                  <div><div class="small">Avg Price</div><div style="font-weight:700;">$${cs.avgPrice.toFixed(2)}</div></div>
+                  <div><div class="small">Avg Units</div><div style="font-weight:700;">${Math.round(cs.avgUnits)}</div></div>
+                  <div><div class="small">Avg Profit</div><div style="font-weight:700;">$${cs.avgProfit.toFixed(2)}</div></div>
+                </div>
+                <div style="margin-top:10px;" class="small"><strong>Insight:</strong> ${cs.insight}</div>
+               </div>`;
+    });
+
+    container.innerHTML = html;
+
+    // draw elbow chart
+    const ctxElbow = document.getElementById('elbowChart').getContext('2d');
+    new Chart(ctxElbow, {
+      type: 'line',
+      data: { labels: clusters.elbowData.map(d=>d.k), datasets: [{ label:'WCSS', data: clusters.elbowData.map(d=>d.wcss), borderColor: '#2563eb', tension:0.2 }] },
+      options: { plugins: { legend:{display:false} }, scales:{ x:{title:{display:true,text:'k'}}, y:{title:{display:true,text:'WCSS'}} } }
+    });
+
+    // draw scatter
+    const datasets = clusters.clusterStats.map(cs => {
+      const pts = processedData.cleaned.map((row, idx) => ({ row, idx })).filter(x => clusters.labels[x.idx] === cs.id).map(x => ({ x: x.row.price, y: x.row.units_sold }));
+      return { label: cs.name, data: pts, backgroundColor: randomColorFor(cs.id), pointRadius:6 };
+    });
+
+    const ctxScatter = document.getElementById('scatterChart').getContext('2d');
+    new Chart(ctxScatter, { type:'scatter', data:{ datasets }, options:{ plugins:{ legend:{position:'top'} }, scales:{ x:{title:{display:true,text:'Price ($)'}}, y:{title:{display:true,text:'Units Sold'}} } } });
+  }
+
+  function randomColorFor(i) {
+    const palette = ['#3b82f6','#ef4444','#10b981','#f59e0b','#8b5cf6','#ec4899','#14b8a6','#f97316'];
+    return palette[i % palette.length];
+  }
+
+  // -------------------------
+  // Regression: Linear & Polynomial (with cross terms)
+  // Uses normal equations solved with Gaussian elimination (sufficient for small dataset)
+  // -------------------------
+  function polynomialExpand(x, degree=2) {
+    // x: array of base features [x1,x2,...]
+    const res = [...x];
+    if (degree >= 2) {
+      // squared terms
+      for (let i=0;i<x.length;i++) res.push(x[i]*x[i]);
+      // cross terms x_i * x_j for i<j
+      for (let i=0;i<x.length;i++) {
+        for (let j=i+1;j<x.length;j++) res.push(x[i]*x[j]);
+      }
+    }
+    return res;
+  }
+
+  function transpose(A) { return A[0].map((_,c)=>A.map(r=>r[c])); }
+  function matMul(A,B) {
+    const n=A.length, p=B[0].length;
+    const m=A[0].length;
+    const C = Array.from({length:n}, ()=>Array(p).fill(0));
+    for (let i=0;i<n;i++) for (let k=0;k<m;k++) for (let j=0;j<p;j++) C[i][j]+=A[i][k]*B[k][j];
+    return C;
+  }
+  function matVecMul(A, v) { return A.map(row => row.reduce((s, val, i) => s + val * v[i], 0)); }
+
+  function solveNormalEq(X, y) {
+    // X: n x m, y: n
+    // compute (X^T X) w = X^T y
+    const Xt = transpose(X);
+    const XtX = matMul(Xt, X); // m x m
+    const Xty = matVecMul(Xt, y); // m
+    // solve XtX * w = Xty via Gaussian elimination
+    return gaussianEliminationSolve(XtX, Xty);
+  }
+
+  function gaussianEliminationSolve(A, b) {
+    const n = A.length;
+    // augmented matrix
+    const M = A.map((row, i) => row.concat([b[i]]));
+    for (let i=0;i<n;i++) {
+      // pivot
+      let maxRow = i;
+      for (let k=i+1;k<n;k++) if (Math.abs(M[k][i]) > Math.abs(M[maxRow][i])) maxRow = k;
+      [M[i], M[maxRow]] = [M[maxRow], M[i]];
+      const pivot = M[i][i];
+      if (Math.abs(pivot) < 1e-12) continue; // singular or nearly singular
+      for (let k=i+1;k<n;k++) {
+        const factor = M[k][i] / pivot;
+        for (let j=i;j<=n;j++) M[k][j] -= factor * M[i][j];
+      }
+    }
+    // back substitution
+    const x = Array(n).fill(0);
+    for (let i=n-1;i>=0;i--) {
+      let s = M[i][n];
+      for (let j=i+1;j<n;j++) s -= M[i][j] * x[j];
+      x[i] = Math.abs(M[i][i]) < 1e-12 ? 0 : s / M[i][i];
+    }
+    return x;
+  }
+
+  function trainLinearModel(X, y) {
+    // add intercept column
+    const Xb = X.map(row => [1, ...row]);
+    const w = solveNormalEq(Xb, y);
+    return w; // length m+1 (intercept first)
+  }
+
+  function predictWithWeights(x, w) {
+    let s = w[0];
+    for (let i=0;i<x.length;i++) s += w[i+1] * x[i];
+    return s;
+  }
+
+  function metrics(y_true, y_pred) {
+    const n = y_true.length;
+    const mse = y_true.reduce((s, val, i) => s + Math.pow(val - y_pred[i], 2), 0) / n;
+    const mae = y_true.reduce((s, val, i) => s + Math.abs(val - y_pred[i]), 0) / n;
+    const rmse = Math.sqrt(mse);
+    const mean = y_true.reduce((a,b)=>a+b,0)/n;
+    const ss_tot = y_true.reduce((s,val)=>s + Math.pow(val-mean,2),0);
+    const ss_res = y_true.reduce((s,val,i)=>s + Math.pow(val - y_pred[i],2),0);
+    const r2 = 1 - (ss_res / ss_tot);
+    return { mse, mae, rmse, r2 };
+  }
+
+  function performRegression() {
+    const data = processedData.cleaned;
+    // features: price, cost, units_sold, promotion_frequency, shelf_level
+    const X = data.map(r => [r.price, r.cost, r.units_sold, r.promotion_frequency, r.shelf_level]);
+    const y = data.map(r => r.profit);
+
+    // shuffle indices then 80/20 split
+    const idx = Array.from({length: X.length}, (_,i)=>i);
+    shuffleArray(idx);
+    const split = Math.floor(0.8 * idx.length);
+    const trainIdx = idx.slice(0, split);
+    const testIdx = idx.slice(split);
+
+    const X_train = trainIdx.map(i => X[i]);
+    const y_train = trainIdx.map(i => y[i]);
+    const X_test = testIdx.map(i => X[i]);
+    const y_test = testIdx.map(i => y[i]);
+
+    // Standardize numeric features for regression using train stats
+    const means = X_train[0].map((_,col)=> X_train.reduce((s,row)=>s+row[col],0)/X_train.length);
+    const stds = X_train[0].map((_,col)=>{
+      const mean = means[col];
+      return Math.sqrt(X_train.reduce((s,row)=>s + Math.pow(row[col]-mean,2),0) / X_train.length) || 1;
+    });
+    const scale = arr => arr.map(r => r.map((val,c)=> (val - means[c]) / stds[c]));
+
+    const X_train_scaled = scale(X_train);
+    const X_test_scaled = scale(X_test);
+
+    // Linear regression
+    const w_lin = trainLinearModel(X_train_scaled, y_train);
+    const preds_lin = X_test_scaled.map(x => predictWithWeights(x, w_lin));
+    const metrics_lin = metrics(y_test, preds_lin);
+
+    // Polynomial degree 2 (squared + cross terms) - expand using scaled features
+    const X_train_poly = X_train_scaled.map(x => polynomialExpand(x, 2));
+    const X_test_poly = X_test_scaled.map(x => polynomialExpand(x, 2));
+
+    const w_poly = trainLinearModel(X_train_poly, y_train);
+    const preds_poly = X_test_poly.map(x => predictWithWeights(x, w_poly));
+    const metrics_poly = metrics(y_test, preds_poly);
+
+    regression = {
+      models: {
+        linear: { name: 'Linear Regression', ...metrics_lin },
+        polynomial: { name: 'Polynomial (deg 2)', ...metrics_poly }
+      },
+      y_test, preds_lin, preds_poly
+    };
+
+    renderRegression();
+  }
+
+  // -------------------------
+  // renderRegression (tables + charts)
+  // -------------------------
+  function renderRegression() {
+    const container = document.getElementById('regressionContent');
+    if (!regression) { container.innerHTML = '<div class="small">No regression results.</div>'; return; }
+
+    const m_lin = regression.models.linear;
+    const m_poly = regression.models.polynomial;
+    const bestModel = m_lin.mse <= m_poly.mse ? 'linear' : 'polynomial';
+
+    let html = `<div class="chart-container"><div class="chart-title">Model Comparison</div>
+      <table><thead><tr><th>Model</th><th>MSE</th><th>MAE</th><th>RMSE</th><th>R²</th></tr></thead><tbody>
+      <tr ${bestModel==='linear' ? 'style="background:#f8fff5"' : ''}><td>${m_lin.name}${bestModel==='linear'? ' <span class="badge">BEST</span>' : ''}</td><td>${m_lin.mse.toFixed(2)}</td><td>${m_lin.mae.toFixed(2)}</td><td>${m_lin.rmse.toFixed(2)}</td><td>${m_lin.r2.toFixed(4)}</td></tr>
+      <tr ${bestModel==='polynomial' ? 'style="background:#f8fff5"' : ''}><td>${m_poly.name}${bestModel==='polynomial'? ' <span class="badge">BEST</span>' : ''}</td><td>${m_poly.mse.toFixed(2)}</td><td>${m_poly.mae.toFixed(2)}</td><td>${m_poly.rmse.toFixed(2)}</td><td>${m_poly.r2.toFixed(4)}</td></tr>
+      </tbody></table></div>`;
+
+    html += `<div class="chart-container"><div class="chart-title">Actual vs Predicted (Best Model Highlighted)</div><canvas id="actualPredChart"></canvas></div>`;
+
+    container.innerHTML = html;
+
+    // draw actual vs predicted using best model
+    const y_test = regression.y_test;
+    const usePreds = (m_lin.mse <= m_poly.mse) ? regression.preds_lin : regression.preds_poly;
+    const scatterData = y_test.map((a,i) => ({ x: a, y: usePreds[i] }));
+
+    const ctx = document.getElementById('actualPredChart').getContext('2d');
+    new Chart(ctx, {
+      type: 'scatter',
+      data: { datasets: [{ label:'Predictions', data: scatterData, backgroundColor:'#2563eb', pointRadius:4 },
+                         { label:'Perfect', data: [{x:Math.min(...y_test), y:Math.min(...y_test)},{x:Math.max(...y_test), y:Math.max(...y_test)}], type:'line', borderColor:'#ef4444', pointRadius:0 }] },
+      options: { scales:{ x:{ title:{display:true,text:'Actual Profit'}}, y:{ title:{display:true,text:'Predicted Profit'} } } }
+    });
+  }
+
+  </script>
+</body>
+</html>
+
+
